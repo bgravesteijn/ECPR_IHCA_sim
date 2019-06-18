@@ -1,0 +1,745 @@
+---
+title: "MarkovECMO"
+author: "Benjamin Gravesteijn"
+date: "21 september 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(ggplot2)
+library(dampack)
+library(hesim)
+library(scales)
+library(knitr)
+
+####################SETUP#################################
+theme_set(new = theme_bw())
+
+#baseline mortality rates per age
+CBS<-data.table(read.csv("C://Users/276018/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/CBS lifetable.csv", sep = ";"))
+CBS$Leeftijd<-as.numeric(CBS$Leeftijd)
+
+RateToProb <- function(r, t) {
+  # Function to convert rates to probabilities
+  # Arg:
+  # r: the annual input rate
+  # t: the cycle length of your model in years
+  #
+  # Retrun:
+  # probability for the time interval
+  1 - exp(-r * t)
+}
+
+probtoodds<-function(x){
+  # Function to convert probabilities to odds
+  # Arg:
+  # x: probability
+  x/(1-x)
+}
+
+oddstoprob<-function(x){
+  # Function to convert odds to probability
+  # Arg:
+  # x: odds
+  x/(x+1)
+}
+```
+
+```{r Decision model, echo=FALSE}
+groups<-factor(c("NE", "EALL"))
+
+df.outcomes<-data.table(expand.grid(age=seq(20, 80, by=5), 
+                         CCI=seq(0, 8, by=1), 
+                         sex=c("Male", "Female"),
+                         grp=levels(groups),
+                         p.Die=as.numeric(NA),
+                         LY=as.numeric(NA),
+                         QALY=as.numeric(NA))) 
+
+
+
+##Data.frame for parameter sets
+ndrawz=1000
+pm.df<-data.frame(p.Die_DNR           = 1,
+                   #Arima et al. Relationship between duration of prehospital resuscitation and favorable prognosis in ventricular fibrillation. Am J. Emerg Med. 2015 May;33(5):677-81
+                   p.rosc_20min        = median(rbeta(n=ndrawz, shape1=(10200+10500+7900+5200),
+                                          shape2=(3600+2600+1700+1200+800+600+300+200+100+50+20+20+10+5+1800+5000+7300+8050+6700+4950+3300+2200+
+                                                    1500+1050+700+600+400+200+200+100+100+50+50+50+20+20+10))),
+                   #Khan et al. Age, Sex, and Hospital factors are associated with the duration of cardiopulmonary resuscitation in hospitalized patients who do not experience sustained return of spontaneous circulation. JAHA 2018 July
+                   b.Die_CPR_age_CCI   = median(log(rlnorm(n = ndrawz, meanlog = (log(0.62^-1)/5.5), sdlog=((log(0.83)-log(0.62))/1.96/5.5)))),   
+                   #Hilerkar al. comoridity and survival i out-of-hospital cardiac arrest.resuscitatio 
+                   p.Die_CPR           = median(rbeta(n=ndrawz, shape1=850, shape2=150)),                
+                   #Zhu A, Zhang J. Meta-analysis of the outcomes of the 2005 and 2010 cardiopulmunary resuscitation guidelines for adults with in-hospital cardiac arrest. AM J EMERG MED 2016;34:113-9
+                   rr.ECMO             = median(rlnorm(n = ndrawz, meanlog = log((205/1884)/(96/376)), sdlog = (log(3.45)-log(2.37))/1.96)), 
+                   #Wang et al: comparison of extracorporeal and conventional cardiopulmonary resuscitation: a meta-analysis of 2260 patients with cardiac arrest. World j emerg med 2017   
+                   or.Die_c.ind_ECMO   = median(rlnorm(ndrawz, meanlog=log(2), sdlog=0.2)),              
+                   #OR for dying, having a contraindication vs not having a contraindication (e.g.: heart failure not bridgable to transplant)
+                   p.Die_Compl         = median(rbeta(ndrawz,10,90)),                  
+                   #probability of dying with complications
+                   p.Compl             = median(rbeta(ndrawz, shape1=379, shape2=621)),                  
+                   #Pubmed ID: 22429669/26825953/20543669
+                   p.ECMO_c.ind        = median(rbeta(n=ndrawz, shape1=20, shape2=80)), 
+                   #Probability of contra-indication for ecmo: 
+                   #h.age_CCI           = rlnorm(n=ndrawz, meanlog=0.37, sdlog=0.06)
+                   #beta for age-CII hazard; Charlson and al. Validation of a combined comorbidity indes. J. Clin Epidemiol 1994;47:1245-1251
+                   #hr.IHCA             = 2.2 
+                   #HR after IHCA; Feingold et al. Long-term survival following in-hospital cardiac arrest: A matched cohort study. Resuscitation 2016;99:72-78
+                   p.DNR_75_min        = median(rbeta(n=ndrawz, shape1 = 5, shape2=95)),
+                   #clinical insight
+                   or.DNR_75_84        = median(rlnorm(n=ndrawz, meanlog = log(1.7), sdlog = (log(2.33)-log(1.7))/1.96)),
+                   or.DNR_85_plus       = median(rlnorm(n=ndrawz, meanlog=log(2.96), sdlog = (log(3.74)-log(2.96))/1.96)),
+                   #probability of DNR --> Cook, I., Kirkup, A. L., Langham, L. J., Malik, M. A., Marlow, G., & Sammy, I. (2017). End of Life Care and Do Not Resuscitate Orders: How Much Does Age Influence Decision Making? A Systematic Review and Meta-Analysis. Gerontology & geriatric medicine, 3, 2333721417713422. doi:10.1177/2333721417713422
+                   c.ECMO              = median(triangle::rtriangle(n=ndrawz, a=5000, b=6000, c=5500)) 
+                   #cost of ECMO
+)
+
+######run model for EALL and NE and extract individualized probabilities and LY
+for(p in 1:nrow(pm.df)){
+ for(i in unique(df.outcomes$age)){
+    for (j in unique(df.outcomes$CCI)){
+    agecat<-ifelse(i<50,0,NA)
+    agecat<-ifelse(i>=50&i<60,1,agecat)
+    agecat<-ifelse(i>=60&i<70,2,agecat)
+    agecat<-ifelse(i>=70&i<80,3,agecat)
+    agecat<-ifelse(i>=80,4,agecat)
+    age_CCI<-(agecat+j)
+    
+    p.DNR                     <- ifelse(i<75, pm.df$p.DNR_75_min[p],
+                                          ifelse(i>=75&i<85, oddstoprob(probtoodds(pm.df$p.DNR_75_min[p])*pm.df$or.DNR_75_84[p]), 
+                                                 ifelse(i>=85, oddstoprob(probtoodds(pm.df$p.DNR_75_min)*pm.df$or.DNR_85_plus[p])))) #The probability of DNR status, depending on age
+    p.Die_CPR_ind             <- oddstoprob(probtoodds(pm.df$p.Die_CPR[p])*exp(pm.df$b.Die_CPR_age_CCI[p]*age_CCI))
+    p.Die_CPR_c.ind           <- oddstoprob(probtoodds(p.Die_CPR_ind)*pm.df$or.Die_c.ind_ECMO[p])
+    p.Die_CPR_ind_20pl_ECMO   <- pm.df$p.Die_CPR[p]*pm.df$rr.ECMO[p]+pm.df$p.Compl[p]*pm.df$p.Die_Compl[p]
+    p.Die_CPR_ind_20pl_noECMO <- pm.df$p.Die_CPR[p]
+    
+    
+     for (l in levels(df.outcomes$sex)){
+      #Markov model each combination of age CCI and sex, parameter input
+      state.names<-c("Alive", "Dead")
+      n.s.<-length(state.names)
+      cycle.length<-20
+      year<-seq(0, (cycle.length-1), by=1)
+      
+      ar.trans<-array(NA, dim = c(n.s., n.s., cycle.length), dimnames = list(state.names, state.names, year))
+      
+      ar.trans["Alive", "Dead", 1:cycle.length]<- seq(RateToProb(r=(ifelse(l=="Male", CBS[Leeftijd==i,]$Man_kans, CBS[Leeftijd==i,]$Vrouw_kans)), t=1),
+                                                      RateToProb(r=(ifelse(l=="Male", CBS[Leeftijd==i+cycle.length,]$Man_kans, CBS[Leeftijd==i,]$Vrouw_kans)), t=1),
+                                                      length.out = cycle.length)
+      #### NOG TE VERWERKEN: DE HAZARD OM DOOD TE GAAN JAARLIJKS NA EEN IHCA OVERLEEFD TE HEBBEN
+      ar.trans["Alive", "Alive", 1:cycle.length] <- rep(1, cycle.length)-ar.trans["Alive", "Dead", 1:cycle.length]
+      ar.trans["Dead", "Dead", 1:cycle.length]<-rep(1, (cycle.length))
+      ar.trans["Dead", "Alive", 1:cycle.length]<-rep(0, (cycle.length))
+      
+      rwd.LY <- matrix(c(1,1,0,0), nrow = 2, byrow = TRUE)
+
+      #Decision tree outcome No ECMO
+      p.Die_NE<-p.DNR*pm.df$p.Die_DNR[p]+
+        (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*(pm.df$p.rosc_20min[p]*p.Die_CPR_ind+
+                                                (1-pm.df$p.rosc_20min[p])*p.Die_CPR_ind_20pl_noECMO)+
+                     pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind)
+      
+    df.outcomes[age==i&CCI==j&sex==l&grp=="NE",]$p.Die<-p.Die_NE
+    
+    
+      
+    s0<-c((1-p.Die_NE),p.Die_NE)
+    l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+    df.outcomes[age==i&CCI==j&sex==l&grp=="NE",]$LY<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+    
+    
+    # #Decision tree outcome ECMO under threshold
+    # p.Die_EACCI_lo<-p.DNR*pm.df$p.Die_DNR[p]+
+    #   (1-p.DNR)*(pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind+
+    #                (1-pm.df$p.ECMO_c.ind[p])*ifelse(age_CCI<pm.df$thr[p], 
+    #                         (p.Die_CPR_ind_ECMO*(1-pm.df$p.Compl[p])+(pm.df$p.Die_Compl[p]+p.Die_CPR_ind_ECMO)*pm.df$p.Compl[p]),
+    #                                  p.Die_CPR_ind_noECMO))
+    # df.outcomes[age==i&CCI==j&sex==l&grp=="EACCI_lo",]$p.Die<-p.Die_EACCI_lo
+    #   
+    # 
+    #   s0<-c((1-p.Die_EACCI_lo),  p.Die_EACCI_lo)
+    #   l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+    #   df.outcomes[age==i&CCI==j&sex==l&grp=="EACCI_lo",]$LY<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+    # 
+    # #Decision tree outcome ECMO above threshold
+    #  p.Die_EACCI_hi<-p.DNR*pm.df$p.Die_DNR[p]+
+    #     (1-p.DNR)*(pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind+
+    #                  (1-pm.df$p.ECMO_c.ind[p])*ifelse(age_CCI>=pm.df$thr[p], 
+    #                                    (p.Die_CPR_ind_ECMO*(1-pm.df$p.Compl[p])+(pm.df$p.Die_Compl[p]+p.Die_CPR_ind_ECMO)*pm.df$p.Compl[p]),
+    #                                    p.Die_CPR_ind_noECMO))
+    # df.outcomes[age==i&CCI==j&sex==l&grp=="EACCI_hi",]$p.Die<-p.Die_EACCI_hi
+    #  
+    #   s0<-c((1-p.Die_EACCI_hi), p.Die_EACCI_hi)
+    #   l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+    #   df.outcomes[age==i&CCI==j&sex==l&grp=="EACCI_hi",]$LY<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+  
+    #Decision tree outcome ECMO for all
+    p.Die_EALL<-p.DNR*pm.df$p.Die_DNR[p]+
+      (1-p.DNR)*(pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind+
+                   (1-pm.df$p.ECMO_c.ind[p])*(pm.df$p.rosc_20min[p]*p.Die_CPR_ind+
+                                                (1-pm.df$p.rosc_20min[p])*p.Die_CPR_ind_20pl_ECMO))
+    df.outcomes[age==i&CCI==j&sex==l&grp=="EALL",]$p.Die<-p.Die_EALL
+  
+      s0<-c((1-p.Die_EALL),  p.Die_EALL)
+      l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+      df.outcomes[age==i&CCI==j&sex==l&grp=="EALL",]$LY<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+    
+    }
+   }
+  }
+}
+```
+
+## Decision model
+The decision model is the result of the decision tree (in-hospital phase) and the markov model. The variable imput parameters are age, CCI and sex. The decision model is displayed below.
+![](beslisboom.jpg)
+```{r result decision model, echo=FALSE}
+pdf(file="C://Users/Gebruiker/Dropbox/Onderzoek/ROUTiNE/ROUTiNE-Markov/Figures_tables/ROUTiNE decision model.pdf")
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=(1-p.Die)*100, x=age, color=factor(CCI)))+
+  geom_smooth(se=FALSE)+
+  scale_y_continuous(name = "Percentage in-hospital survival")+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=LY, x=age, color=factor(CCI)))+
+  geom_smooth(se = FALSE)+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+dev.off()
+
+tiff("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Manuscript/Submission/Resuscitation/Revision/Fig1_suppl1.tif",width = 7000, height = 6000, res=1200)
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=(1-p.Die)*100, x=age, color=factor(CCI)))+
+  geom_smooth(se=FALSE)+
+  scale_y_continuous(name = "Percentage in-hospital survival")+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18),
+        strip.text.x=element_text(size=20))
+dev.off()
+
+tiff("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Manuscript/Submission/Resuscitation/Revision/Fig2_suppl1.tif",width = 7000, height = 6000, res=1200)
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=LY, x=age, color=factor(CCI)))+
+  geom_smooth(se = FALSE)+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18),
+        strip.text.x=element_text(size=20))
+dev.off()
+
+
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=(1-p.Die)*100, x=age, color=factor(CCI)))+
+  geom_smooth(se=FALSE)+
+  scale_y_continuous(name = "Percentage in-hospital survival")+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+
+ggplot(df.outcomes[grp%in%c("NE", "EALL"),][sex=="Male",], aes(y=LY, x=age, color=factor(CCI)))+
+  geom_smooth(se = FALSE)+
+  scale_color_discrete(name="CCI")+
+  facet_wrap(~grp)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+
+1-quantile(df.outcomes[grp=="NE",]$p.Die)
+1-quantile(df.outcomes[grp=="EALL",]$p.Die)
+quantile(df.outcomes[grp=="NE",]$LY)
+quantile(df.outcomes[grp=="EALL",]$LY)
+
+```
+
+#Full PSA
+For the PSA, a 1000 patient cohort is simulated with random age, gender and cci. This cohort enters the decision model 1000 times, with resampled values for the model parameters. These parameters are based on literature. This is performed 4 times: for EACCI_lo with a threshold of 3, 4, 5 and 6. To see what would be cost-effective. The cost-effectiveness is calculated below. 
+```{r eval=FALSE, include=FALSE}
+#Average group of patients
+##Girotra et al. Trends in survival after in-hospital cardiac arrest. NEJM 2012:
+#-->Age (mean=66) and Gender (mostly men)
+##Andrew et al. The influence of comorbidity on survival and long-term outcomes after out-of-hospital cardiac arrest. Resuscitation 2017
+#-->CCI (mostly 1)
+set.seed(1234)
+cohort.df<-data.frame(age=round(rnorm(n = 1000, mean = 65.9, sd = 15.8),0),
+                      gender=rbinom(n = 1000, size = 1, prob = 0.583),
+                      cci=sample(0:8, replace = TRUE, size=1000, 
+                                 prob=c((5881/15953), (3684/15953), (2996/15953), (1801/15953),
+                                        (1591/15953)*0.4,(1591/15953)*0.3,(1591/15953)*0.2,(1591/15953)*0.05,(1591/15953)*0.05)),
+                      LYNE=NA,
+                      LYEACCI_lo=NA,
+                      LYEALL=NA,
+                      costNE=NA,
+                      costEACCI_lo=NA,
+                      costEALL=NA,
+                      QALYNE=NA,
+                      QALYEACCI_lo=NA,
+                      QALYEALL=NA) 
+cohort.df$age<-ifelse(cohort.df$age<18, 18, cohort.df$age)
+
+# #basecase analysis
+# cohort.df<-data.frame(t(apply(cohort.df, 2, median)))
+
+#icremental costs ecmo:
+costs <- c(129792,3342,16853,163201,40544,119000,45883,84616)
+#harvey et al US and international in-hospital costs of extracorporeal membrane oxygenatio: a systematic review
+
+##Data.frame for parameter sets
+ndrawz<-1000
+set.seed(1234)
+pm.df<-data.frame(  p.DNR_75_min        = rbeta(n=ndrawz, shape1 = 5, shape2=95),
+                    #clinical insight
+                    or.DNR_75_84        = rlnorm(n=ndrawz, meanlog = log(1.7), sdlog = (log(2.33)-log(1.7))/1.96),
+                    or.DNR_85_plus       = rlnorm(n=ndrawz, meanlog=log(2.96), sdlog = (log(3.74)-log(2.96))/1.96),
+                    #probability of DNR --> Cook, I., Kirkup, A. L., Langham, L. J., Malik, M. A., Marlow, G., & Sammy, I. (2017). End of Life Care and Do Not Resuscitate Orders: How Much Does Age Influence Decision Making? A Systematic Review and Meta-Analysis. Gerontology & geriatric medicine, 3, 2333721417713422. doi:10.1177/2333721417713422
+                    p.Die_DNR           = 1,
+                    p.Die_CPR           = rbeta(n=ndrawz, shape1=850, shape2=150),                
+                    #Zhu A, Zhang J. Meta-analysis of the outcomes of the 2005 and 2010 cardiopulmunary resuscitation guidelines for adults with in-hospital cardiac arrest. AM J EMERG MED 2016;34:113-9
+                    p.ECMO_c.ind        = rbeta(n=ndrawz, shape1=10, shape2=40), 
+                    #Probability of contra-indication for ecmo: 
+                    or.Die_c.ind_ECMO   = rlnorm(ndrawz, meanlog=log(2), sdlog=0.2),              
+                    #OR for dying, having a contraindication vs not having a contraindication (e.g.: heart failure not bridgable to transplant)
+                    p.rosc_20min        = rbeta(n=ndrawz, shape1=(10200+10500+7900+5200)*0.01,
+                                                shape2=(3600+2600+1700+1200+800+600+300+200+100+50+20+20+10+5+1800+5000+7300+8050+6700+4950+3300+
+                                                          2200+1500+1050+700+600+400+200+200+100+100+50+50+50+20+20+10)*0.01),
+                    #Khan et al. Age, Sex, and Hospital factors are associated with the duration of cardiopulmonary resuscitation in hospitalized patients who do not experience sustained return of spontaneous circulation. JAHA 2018 July
+                    rr.ECMO             = rlnorm(n = ndrawz, meanlog = log((205/1884)/(96/376)), sdlog = (log(3.45)-log(2.37))/1.96), 
+                    #Wang et al: comparison of extracorporeal and conventional cardiopulmonary resuscitation: a meta-analysis of 2260 patients with cardiac arrest. World j emerg med 2017   
+                    p.Compl             = rbeta(ndrawz, shape1=379*0.1, shape2=621*0.1),                  
+                    #Pubmed ID: 22429669/26825953/20543669
+                    p.Die_Compl         = rbeta(ndrawz,shape1 = 10,shape2 = 90),                  
+                    #probability of dying with complications
+                    b.Die_CPR_age_CCI   = log(rlnorm(n = ndrawz, meanlog = (log(0.62^-1)/5.5), sdlog=((log(0.83)-log(0.62))/1.96/5.5))),   
+                    #Hilerkar al. comoridity and survival i out-of-hospital cardiac arrest.resuscitatio 
+                    c.ECMO             = rnorm(ndrawz, 51997, 10767), 
+#Lansink-Hartgring AO, Van Den Hengel B, Van Der Bij W, et al (2016) Hospital Costs of Extracorporeal Life Support Therapy. Crit Care Med. 
+                    c.first_year       = triangle::rtriangle(n=ndrawz, a=374, b=40620, c=18629)*0.85,
+                    c.after_firstyear  = triangle::rtriangle(n=ndrawz, a=(374-162)/(9/12), #the first year costs, without the extra costs of the first three months
+                                                             b=(40620-28603)/(9/12), 
+                                                             c=(18629-7741)/(9/12))*0.85,
+#Readmission Rates and Long-Term Hospital Costs Among Survivors of In-Hospital Cardiac Arrest Paul S. Chan, M.D., M.Sc.  
+                    utility.men         = triangle::rtriangle(n=1000, a=0.66, b=0.89, c=0.82),
+                    utility.women       = triangle::rtriangle(n=1000, a=0.58, b=0.82, c=0.81)
+                    # Israelsson, J., Bremer, A., Herlitz, J., Axelsson, ?. B., Cronberg, T., Dj?rv, T., Kristofferzon, M.,
+                    # Larsson, I., Lilja, G., Sunnerhagen, K. S., Wallin, E., ?gren, S., ?kerman, E., ?restedt, K., (2017),
+                    # Health status and psychological distress among in-hospital cardiac arrest survivors in relation to
+                    # gender, Resuscitation, 114, 27-33. https://dx.doi.org/10.1016/j.resuscitation.2017.02.006
+                   )
+psa.samp <- round(t(apply(pm.df, 2, quantile, probs=c(0.5,0.025,0.975))),2)
+psa.samp <- data.frame(parameter=rownames(psa.samp),
+                       distribution=paste(psa.samp[,1],
+                                          " (",
+                                          psa.samp[,2],
+                                          " - ",
+                                          psa.samp[,3],
+                                          ")", 
+                                          sep=""))
+write.csv2(psa.samp, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Figures_tables/psa.dist.csv")
+
+
+LY<-data.frame(NE=rep(NA, nrow(pm.df)), 
+               EACCI_lo=NA,
+               NE_QALY=NA,
+               EACCI_lo_QALY=NA,
+               costNE=NA,
+               costEACCI_lo=NA)
+
+for(thr in c(2,3,4,9)){
+for(p in 1:nrow(pm.df)){
+  #time<-Sys.time()
+  for(i in 1:nrow(cohort.df)){
+      agecat<-ifelse(cohort.df[i,]$age<50,0,NA)
+      agecat<-ifelse(cohort.df[i,]$age>=50&cohort.df[i,]$age<60,1,agecat)
+      agecat<-ifelse(cohort.df[i,]$age>=60&cohort.df[i,]$age<70,2,agecat)
+      agecat<-ifelse(cohort.df[i,]$age>=70&cohort.df[i,]$age<80,3,agecat)
+      agecat<-ifelse(cohort.df[i,]$age>=80,4,agecat)
+      age_CCI<-(agecat+cohort.df[i,]$cci)
+      
+       p.DNR                     <- ifelse(i<75, pm.df$p.DNR_75_min[p],
+                                          ifelse(i>=75&i<85, oddstoprob(probtoodds(pm.df$p.DNR_75_min[p])*pm.df$or.DNR_75_84[p]), 
+                                                 ifelse(i>=85, oddstoprob(probtoodds(pm.df$p.DNR_75_min)*pm.df$or.DNR_85_plus[p])))) #The probability of DNR status, depending on age
+      p.Die_CPR_ind             <- oddstoprob(probtoodds(pm.df$p.Die_CPR[p])*exp(pm.df$b.Die_CPR_age_CCI[p]*age_CCI))
+      p.Die_CPR_c.ind           <- oddstoprob(probtoodds(p.Die_CPR_ind)*pm.df$or.Die_c.ind_ECMO[p])
+      p.Die_CPR_ind_20pl_ECMO   <- pm.df$p.Die_CPR[p]*pm.df$rr.ECMO[p]+pm.df$p.Compl[p]*pm.df$p.Die_Compl[p]
+      p.Die_CPR_ind_20pl_noECMO <- pm.df$p.Die_CPR[p]
+      
+        #Markov model each combination of age CCI and sex, parameter input
+        state.names<-c("Alive", "Dead", "Complication")
+        n.s.<-length(state.names)
+        cycle.length<-20
+        year<-seq(0, (cycle.length-1), by=1)
+        
+        ar.trans<-array(NA, dim = c(n.s., n.s., cycle.length), dimnames = list(state.names, state.names, year))
+        
+        ### The probability to die per year
+        ar.trans["Alive", "Dead", 1:cycle.length]<- seq(RateToProb(r=(ifelse(cohort.df[i,]$gender==1, 
+                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
+                                                                                                  100,              
+                                                                                              cohort.df[i,]$age),]$Man_kans,
+                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
+                                                                                                  100,
+                                                                                          cohort.df[i,]$age),]$Vrouw_kans)), 
+                                                                   t=1),
+                                                        RateToProb(r=(ifelse(cohort.df[i,]$gender==1,
+                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age +
+                                                                                                    cycle.length>100, 
+                                                                                                  100,
+                                                                                 (cohort.df[i,]$age+cycle.length)), 
+                                                                                 ]$Man_kans,
+                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age+
+                                                                                                    cycle.length>100, 
+                                                                                                  100,
+                                                                                                  (cohort.df[i,]$age+
+                                                                                                     cycle.length)),
+                                                                                 ]$Vrouw_kans)), 
+                                                                   t=1),
+                                                        length.out = cycle.length)
+          ar.trans["Complication", "Dead", 1:cycle.length] <- ar.trans["Alive", "Dead", 1:cycle.length]
+        
+        
+        # the probability to stay in the same state
+        ar.trans["Alive", "Alive", 1:cycle.length] <- rep(1, cycle.length)-ar.trans["Alive", "Dead", 1:cycle.length]
+        ar.trans["Complication", "Complication", 1:cycle.length] <- rep(1, cycle.length)-ar.trans["Complication", "Dead", 1:cycle.length]
+        
+        # the probability to receive complication
+        ar.trans["Alive", "Complication", 1:cycle.length] <- rep(0, cycle.length)
+        # the probability to not have a complication anymore
+        ar.trans["Complication", "Alive", 1:cycle.length] <- rep(0, cycle.length)
+
+        #absorbing state
+        ar.trans["Dead", "Dead", 1:cycle.length]<-rep(1, (cycle.length))
+        ar.trans["Dead", "Alive", 1:cycle.length]<-rep(0, (cycle.length))
+        ar.trans["Dead", "Complication", 1:cycle.length]<-rep(0, (cycle.length))
+        
+        #REWARD MATRIXES
+        rwd.LY<-matrix(c(1,1,1,0,0,0,1,1,1), nrow = 3, byrow = TRUE)
+        if(cohort.df[i,]$gender==1){
+          rwd.QALY<-matrix(c(pm.df$utility.men[p],
+                             pm.df$utility.men[p],
+                             pm.df$utility.men[p],
+                             0,0,0,
+                             pm.df$utility.men[p],
+                             pm.df$utility.men[p],
+                             pm.df$utility.men[p]), nrow = 3, byrow = TRUE)
+          
+        }else{
+          rwd.QALY<-matrix(c(pm.df$utility.women[p],
+                             pm.df$utility.women[p],
+                             pm.df$utility.women[p],
+                             0,0,0,
+                             pm.df$utility.women[p],
+                             pm.df$utility.women[p],
+                             pm.df$utility.women[p]), nrow = 3, byrow = TRUE)
+          
+        }
+        
+        
+
+        
+        #Decision tree outcome No ECMO
+        p.Die_NE<-p.DNR*pm.df$p.Die_DNR[p]+
+          (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*(pm.df$p.rosc_20min[p]*p.Die_CPR_ind+
+                                                  (1-pm.df$p.rosc_20min[p])*p.Die_CPR_ind_20pl_noECMO)+
+                                                   pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind)
+        p.compl_NE <- 0
+        s0<-c((1-p.Die_NE-p.compl_NE),p.Die_NE, p.compl_NE)
+        l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+        cohort.df[i,]$LYNE<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+        cohort.df[i,]$QALYNE<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
+        cohort.df[i,]$costNE       <- 0
+        
+        #Decision tree outcome ECMO under threshold
+        p.Die_EACCI_lo<-p.DNR*pm.df$p.Die_DNR[p]+
+          (1-p.DNR)*(pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind+
+                       (1-pm.df$p.ECMO_c.ind[p])*(pm.df$p.rosc_20min[p]*p.Die_CPR_ind+
+                                                    (1-pm.df$p.rosc_20min[p])*ifelse(age_CCI<thr, 
+                                                        p.Die_CPR_ind_20pl_ECMO,
+                                                        p.Die_CPR_ind_20pl_noECMO)))
+        p.compl_EACCI_LO <- (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*((1-pm.df$p.rosc_20min[p])*ifelse(age_CCI<thr, 
+                                                        pm.df$p.Compl[p],0)))
+        s0<-c((1-p.Die_EACCI_lo-p.compl_EACCI_LO),p.Die_EACCI_lo, p.compl_EACCI_LO )
+        l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+        cohort.df[i,]$LYEACCI_lo<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+        cohort.df[i,]$QALYEACCI_lo<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
+        cohort.df[i,]$costEACCI_lo <- (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*
+                                                   ((1-pm.df$p.rosc_20min[p])*ifelse(age_CCI<thr, 
+                                                        pm.df[p,]$c.ECMO,0)))
+
+        }
+  
+  LY[p,]$NE       <- mean(cohort.df$LYNE)
+  LY[p,]$EACCI_lo <- mean(cohort.df$LYEACCI_lo)
+
+  LY[p,]$costNE       <- mean(cohort.df$costNE)
+  LY[p,]$costEACCI_lo <- mean(cohort.df$costEACCI_lo)  
+
+  LY[p,]$NE_QALY       <- mean(cohort.df$QALYNE)
+  LY[p,]$EACCI_lo_QALY <- mean(cohort.df$QALYEACCI_lo)
+  
+  #Sys.time()-time    
+}
+if(thr==2){
+  LY2<-LY
+  save(LY2, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr2.RData")
+}
+if(thr==3){
+  LY3<-LY
+  save(LY3, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr3.RData")
+}
+if(thr==4){
+  LY4<-LY
+  save(LY4, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr4.RData")
+}
+if(thr==9){
+  LYALL<-LY
+  save(LYALL, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thrall.RData")
+}
+}
+```
+
+```{r echo=TRUE}
+load(file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr2.RData")
+load(file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr3.RData")
+load(file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thr4.RData")
+load(file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/LY_psa_thrall.RData")
+
+pdf("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Figures_tables/Final output.pdf")
+boxplot(LY3$NE_QALY,  LY2$EACCI_lo_QALY,LY3$EACCI_lo_QALY,LY4$EACCI_lo_QALY,LYALL$EACCI_lo_QALY, 
+        names = c("NE",  "ACCI < 2","ACCI < 3","ACCI < 4","EALL"), ylab="QALY", cex=0.8)
+boxplot(LY3$costNE/LY3$NE_QALY,LY2$costEACCI_lo/LY2$EACCI_lo_QALY,LY3$costEACCI_lo/LY3$EACCI_lo_QALY,
+        LY4$costEACCI_lo/LY4$EACCI_lo_QALY,   LYALL$costEACCI_lo/LYALL$EACCI_lo_QALY, 
+        names = c("NE",  "ACCI < 2","ACCI < 3","ACCI < 4","EALL"), ylab="cost/QALY", cex=0.8)
+dev.off()
+
+boxplot(LY3$NE_QALY,  LY2$EACCI_lo_QALY,LY3$EACCI_lo_QALY,LY4$EACCI_lo_QALY,LYALL$EACCI_lo_QALY, 
+        names = c("NE",  "ACCI < 2","ACCI < 3","ACCI < 4","EALL"), ylab="QALY", cex=0.8)
+boxplot(LY3$costNE/LY3$NE_QALY,LY2$costEACCI_lo/LY2$EACCI_lo_QALY,LY3$costEACCI_lo/LY3$EACCI_lo_QALY,
+        LY4$costEACCI_lo/LY4$EACCI_lo_QALY,   LYALL$costEACCI_lo/LYALL$EACCI_lo_QALY, 
+        names = c("NE",  "ACCI < 2","ACCI < 3","ACCI < 4","EALL"), ylab="cost/QALY", cex=0.8)
+
+```
+It is observed that the QALYs and costs increase when more patients are included for ECMO. However, the cost-effectiveness is not yet demonstrated through this analysis. 
+
+## Cost-effectiveness
+To assess cost-effectivenss, cost-effectiveness acceptability curves are plotted. This indicates which strategy would be cost-effective, conditional on the willingness to pay threshold (WTP). In the Netherlands, this is often indicated at 20.000 euros. 
+```{r costeffectivenss}
+##cost-effectiveness analaysis
+ce <- data.table(data.frame(strategy=c(rep("NE", nrow(LY2)),
+                                       rep("thr2", nrow(LY2)), 
+                                       rep("thr3", nrow(LY2)), 
+                                       rep("thr4", nrow(LY2)),
+                                       rep("EALL", nrow(LY2))),
+                            QALY=c(LY2$NE_QALY, LY2$EACCI_lo_QALY,LY3$EACCI_lo_QALY,
+                                   LY4$EACCI_lo_QALY, LYALL$EACCI_lo_QALY),
+                            cost=c(LY2$costNE, LY2$costEACCI_lo, LY3$costEACCI_lo, 
+                                   LY4$costEACCI_lo, LYALL$costEACCI_lo),
+                            sim=rep(1:nrow(LY3), 5),
+                            grp="IHCA"))
+
+ktop <- 100000 
+icea.dt <-  icea(ce, k = seq(0, ktop, 500), sim = "sim", strategy = "strategy",
+                 grp="grp", e = "QALY", c = "cost")
+icea.pw.dt <-  icea_pw(ce,  k = seq(0, ktop, 500), comparator = "NE",
+                       sim = "sim", strategy = "strategy", e = "QALY", c = "cost")
+
+ylim <- max(icea.pw.dt$delta[, ic])
+xlim <- ceiling(max(icea.pw.dt$delta[, ie]))
+ggplot(icea.pw.dt$delta, aes(x = ie, y = ic, col = factor(strategy))) + 
+  geom_point(size = .2) + 
+  xlab("Incremental QALYs") + ylab("Incremental cost") +
+  # scale_y_continuous(label = euro, limits = c(-ylim, ylim)) +
+  scale_x_continuous(limits = c(-xlim, xlim), breaks = seq(-6, 6, 2)) +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy") +
+  geom_abline(slope = 20000, linetype = "dashed") +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0)
+
+##ICERs###
+cqaly    <- ce[,median(cost/QALY), by=strategy]
+cqaly$lo <- ce[,quantile(cost/QALY, probs=0.025), by=strategy][,2]
+cqaly$hi <- ce[,quantile(cost/QALY, probs=0.975), by=strategy][,2]
+
+calc.icer <- function(str1=NULL, str2=NULL, measure=NULL){
+  if(measure==1){
+  res <- median((ce$cost[ce$strategy==str2]-ce$cost[ce$strategy==str1])/(ce$QALY[ce$strategy==str2]-ce$QALY[ce$strategy==str1])) 
+  }else{
+    if(measure==2){
+      res <- quantile((ce$cost[ce$strategy==str2]-ce$cost[ce$strategy==str1])/(ce$QALY[ce$strategy==str2]-ce$QALY[ce$strategy==str1]), probs=0.025)
+    }else{
+      if(measure==3){
+        res <- quantile((ce$cost[ce$strategy==str2]-ce$cost[ce$strategy==str1])/(ce$QALY[ce$strategy==str2]-ce$QALY[ce$strategy==str1]), probs=0.975)
+      }
+    }
+  }
+  return(res)
+}
+
+ICER <- round(data.frame(ICER=c(calc.icer(str1 = "NE", str2 = "EALL", measure = 1),
+                                NA,
+                                calc.icer(str1 = "NE", str2 = "thr2", measure = 1),
+                                calc.icer(str1 = "NE", str2 = "thr3", measure = 1),
+                                calc.icer(str1 = "NE", str2 = "thr4", measure = 1)),
+                   lo=c(calc.icer(str1 = "NE", str2 = "EALL", measure = 2),
+                        NA,
+                          calc.icer(str1 = "NE", str2 = "thr2", measure = 2),
+                          calc.icer(str1 = "NE", str2 = "thr3", measure = 2),
+                          calc.icer(str1 = "NE", str2 = "thr4", measure = 2)),
+                   hi=c(calc.icer(str1 = "NE", str2 = "EALL", measure = 3),
+                        NA,
+                          calc.icer(str1 = "NE", str2 = "thr2", measure = 3),
+                          calc.icer(str1 = "NE", str2 = "thr3", measure = 3),
+                          calc.icer(str1 = "NE", str2 = "thr4", measure = 3))),1)
+icer <- c(paste(ICER$ICER, " (", ICER$lo, " - ", ICER$hi, ")", sep=""))
+
+cost     <- paste(round(ce[,median(cost), by=strategy]$V1,1)," (",round(ce[,quantile(cost, probs=0.025), by=strategy]$V1,1)," - ",round(ce[,quantile(cost, probs=0.975), by=strategy]$V1,1), ")", sep="")
+
+QALY     <- paste(round(ce[,median(QALY), by=strategy]$V1,2)," (",round(ce[,quantile(QALY, probs=0.025), by=strategy]$V1,2)," - ",round(ce[,quantile(QALY, probs=0.975), by=strategy]$V1,2), ")", sep="")
+
+costqaly <- paste(round(ce[,median(cost/QALY), by=strategy]$V1,1)," (",round(ce[,quantile(cost/QALY, probs=0.025), by=strategy]$V1,1)," - ",round(ce[,quantile(cost/QALY, probs=0.975), by=strategy]$V1,1), ")", sep="")
+
+result <- cbind(cost, QALY, costqaly, icer)
+result <- result[c(2,3,4,5,1), ]
+rownames(result) <- c("NE", "thr2", "thr3", "thr4", "EALL")
+
+write.csv2(result, file="C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Figures_tables/costqalyicer.csv")
+kable(result)
+
+ggplot(icea.dt$mce, aes(x = k, y = prob, col = factor(strategy))) +
+  geom_line(cex=1.5) + xlab("Willingess to pay") +
+  ylab("Probability most cost-effective") +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy")
+
+pdf("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Figures_tables/ce_analysis.pdf")
+ggplot(icea.pw.dt$delta, aes(x = ie, y = ic, col = factor(strategy))) + 
+  geom_point(size = 2) + 
+  xlab("Incremental QALYs") + ylab("Incremental cost") +
+  # scale_y_continuous(label = euro, limits = c(-ylim, ylim)) +
+  scale_x_continuous(limits = c(0, xlim), breaks = seq(-6, 6, 2)) +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy") +
+  geom_abline(slope = 20000, linetype = "dashed") +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0)+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+
+ggplot(icea.dt$mce, aes(x = k, y = prob, col = factor(strategy))) +
+  geom_line(cex=1.5) + xlab("Willingess to pay") +
+  ylab("Probability most cost-effective") +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy")+
+  theme(axis.title.x=element_text(size=20),
+        axis.text.x=element_text(size=18),
+        axis.title.y=element_text(size=20),
+        axis.text.y=element_text(size=18),
+        legend.title=element_text(size=20),
+        legend.text=element_text(size=18))
+dev.off()
+
+tiff("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Manuscript/Submission/Resuscitation/Revision/Fig3_suppl1.tif",width = 7000, height = 6000, res=1200)
+ggplot(icea.pw.dt$delta, aes(x = ie, y = ic, col = factor(strategy))) + 
+  geom_point(cex = 2) + 
+  xlab("Incremental QALYs") + ylab("Incremental cost") +
+  # scale_y_continuous(label = euro, limits = c(-ylim, ylim)) +
+  scale_x_continuous(limits = c(-0, xlim), breaks = seq(-6, 6, 2)) +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy") +
+  geom_abline(slope = 20000, linetype = "dashed") +
+  geom_hline(yintercept = 0) + geom_vline(xintercept = 0)+
+  theme(axis.title.x=element_text(size=17),
+        axis.title.y=element_text(size=17),
+        axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        legend.title=element_text(size=17),
+        legend.text=element_text(size=16))
+dev.off()
+
+tiff("C://Users/Gebruiker/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Manuscript/Submission/Resuscitation/Revision/Fig2.tif",width = 7000, height = 6000, res=1200)
+ggplot(icea.dt$mce, aes(x = k, y = prob, col = factor(strategy))) +
+  geom_line(cex=1.5) + xlab("Willingess to pay") +
+  ylab("Probability most cost-effective") +
+  geom_vline(xintercept = 12500, lty=2)+
+  geom_vline(xintercept = 9500, lty=2)+
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy")+
+  theme(axis.title.x=element_text(size=17),
+        axis.title.y=element_text(size=17),
+        axis.text.x=element_text(size=16),
+        axis.text.y=element_text(size=16),
+        legend.title=element_text(size=17),
+        legend.text=element_text(size=16))
+dev.off()
+
+res.mce <- data.table(icea.dt$mce)
+plot(res.mce[(strategy=="NE"|strategy=="thr4"),.(prob), by=k], xlim=c(15000,18000))
+res.mce[k==43000&(strategy=="NE"|strategy=="thr4"),.(prob)]
+plot(res.mce[(strategy=="EALL"|strategy=="thr4"),.(prob), by=k], xlim=c(55000,57000))
+res.mce[k==55500&(strategy=="EALL"|strategy=="thr4"),.(prob)]
+max(res.mce[strategy=="thr4",]$prob)
+```
+
+## Expected value of perfect information
+This should be interpreted as the value (in Euros) of knowing what strategy would be the best, in terms of cost-effectiveness. It is calculated by looking in the 1000 PSA simulations which strategy was the most beneficial, and how much net monetary benefit could be gained by choosing the right strategy. This then is calculated with net monetary benefits from a range of willingness to pay threshold (NMB is dependent on WTP). 
+```{r}
+ggplot(icea.dt$evpi, aes(x = k, y = evpi)) +
+  geom_line() +  xlab("Willingess to pay") +
+  ylab("Expected value of perfect information") +
+  scale_x_continuous(breaks = seq(0, ktop, 100000), label = comma) +
+  scale_y_continuous(label = scales::dollar) +
+  theme(legend.position = "bottom") + scale_colour_discrete(name = "Strategy")
+```
+
+
+## Tornado plot assumed parameters
+```{r}
+icer <- (LYALL$costEACCI_lo-LYALL$costNE)/(LYALL$EACCI_lo_QALY-LYALL$NE_QALY)
+
+prm_as <- pm.df
+prm_as <- data.frame(scale(prm_as, center = TRUE, scale=TRUE))
+prm_as$icer <- icer-mean(icer) #more or less than average
+
+fit <- lm(icer~., data=prm_as[,-4])
+res <- coef(summary(fit))[c("p.DNR_75_min",
+                     "p.ECMO_c.ind",
+                     "or.Die_c.ind_ECMO",
+                     "p.Die_Compl"),
+                   c("Estimate", "Std. Error")]
+
+res_nice <- paste(sprintf("%.2f",res[,1]),
+                  " (", 
+                  sprintf("%.2f",res[,1]-1.96*res[,2]), 
+                  " - ", 
+                  sprintf("%.2f",res[,1]+1.96*res[,2]), 
+                  ")", 
+                  sep="")
+names(res_nice) <- rownames(res)
+res_nice
+```
+
