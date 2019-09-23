@@ -40,7 +40,7 @@ model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
   for(i in 1:length(thresholds)){LY.l[[i]] <- LY}
   names(LY.l) <- paste("thr", thresholds, sep="")
   for(thr in thresholds){
-    message(paste("Current threshold =", thr, sep=""))
+    message(paste("Current threshold =", thr))
     for(p in 1:nrow(pm.df)){
       #time<-Sys.time()
       for(i in 1:nrow(cohort.df)){
