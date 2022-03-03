@@ -19,8 +19,8 @@ library(knitr)
 theme_set(new = theme_bw())
 
 #baseline mortality rates per age
-CBS<-data.table(read.csv("C://Users/276018/Dropbox/onderzoek/ROUTiNE/ROUTiNE-Markov/Data/CBS lifetable.csv", sep = ";"))
-CBS$Leeftijd<-as.numeric(CBS$Leeftijd)
+CBS<-data.table(read.csv("Data/CBS lifetable.csv", sep = ";"))
+CBS$Leeftijd<-as.numeric(substr(CBS$Leeftijd, start = 1,stop = 2))
 
 RateToProb <- function(r, t) {
   # Function to convert rates to probabilities
@@ -401,29 +401,30 @@ for(p in 1:nrow(pm.df)){
         ar.trans<-array(NA, dim = c(n.s., n.s., cycle.length), dimnames = list(state.names, state.names, year))
         
         ### The probability to die per year
-        ar.trans["Alive", "Dead", 1:cycle.length]<- seq(RateToProb(r=(ifelse(cohort.df[i,]$gender==1, 
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
-                                                                                                  100,              
-                                                                                              cohort.df[i,]$age),]$Man_kans,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
-                                                                                                  100,
-                                                                                          cohort.df[i,]$age),]$Vrouw_kans)), 
-                                                                   t=1),
-                                                        RateToProb(r=(ifelse(cohort.df[i,]$gender==1,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age +
-                                                                                                    cycle.length>100, 
-                                                                                                  100,
-                                                                                 (cohort.df[i,]$age+cycle.length)), 
-                                                                                 ]$Man_kans,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age+
-                                                                                                    cycle.length>100, 
-                                                                                                  100,
-                                                                                                  (cohort.df[i,]$age+
-                                                                                                     cycle.length)),
-                                                                                 ]$Vrouw_kans)), 
-                                                                   t=1),
-                                                        length.out = cycle.length)
-          ar.trans["Complication", "Dead", 1:cycle.length] <- ar.trans["Alive", "Dead", 1:cycle.length]
+        ar.trans["Alive", "Dead", 1:cycle.length]<- seq(
+          RateToProb(r=(ifelse(cohort.df[i,]$gender==1,
+                               CBS[Leeftijd==ifelse(cohort.df[i,]$age>99,
+                                                    99,
+                                                    cohort.df[i,]$age),]$Man_kans,
+                               CBS[Leeftijd==ifelse(cohort.df[i,]$age>99,
+                                                    99,
+                                                    cohort.df[i,]$age),]$Vrouw_kans)),
+                     t=1),
+          RateToProb(r=(ifelse(cohort.df[i,]$gender==1,
+                               CBS[Leeftijd==ifelse(cohort.df[i,]$age +
+                                                      cycle.length>99,
+                                                    99,
+                                                    (cohort.df[i,]$age+cycle.length)),
+                                   ]$Man_kans,
+                               CBS[Leeftijd==ifelse(cohort.df[i,]$age+
+                                                      cycle.length>99,
+                                                    99,
+                                                    (cohort.df[i,]$age+
+                                                       cycle.length)),
+                                   ]$Vrouw_kans)),
+                     t=1),
+          length.out = cycle.length)
+        ar.trans["Complication", "Dead", 1:cycle.length] <- ar.trans["Alive", "Dead", 1:cycle.length]
         
         
         # the probability to stay in the same state
@@ -471,6 +472,7 @@ for(p in 1:nrow(pm.df)){
                                                   (1-pm.df$p.rosc_20min[p])*p.Die_CPR_ind_20pl_noECMO)+
                                                    pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind)
         p.compl_NE <- 0
+        
         s0<-c((1-p.Die_NE-p.compl_NE),p.Die_NE, p.compl_NE)
         l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
         cohort.df[i,]$LYNE<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)

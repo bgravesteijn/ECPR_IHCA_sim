@@ -1,10 +1,11 @@
-model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
+model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL, parallel=FALSE){
   ####################SETUP#################################
   theme_set(new = theme_bw())
   
   #baseline mortality rates per age
   CBS<-data.table(read.csv("data/CBS lifetable.csv", sep = ";"))
-  CBS$Leeftijd<-as.numeric(CBS$Leeftijd)
+  CBS$Leeftijd<-as.numeric(substr(CBS$Leeftijd, start = 1, stop=2))
+  
   
   RateToProb <- function(r, t) {
     # Function to convert rates to probabilities
@@ -37,13 +38,24 @@ model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
                  costNE=NA,
                  costEACCI_lo=NA)
   LY.l <- vector("list", length = length(thresholds))
-  for(i in 1:length(thresholds)){LY.l[[i]] <- LY}
   names(LY.l) <- paste("thr", thresholds, sep="")
+  
+  if(parallel){
+    #For parallel computing
+    library(doParallel)  
+    n_cores <- detectCores() - 1
+    cl <- makeCluster(n_cores)  
+    registerDoParallel(cl)  
+  }
+  
+  
   for(thr in thresholds){
     message(paste("Current threshold =", thr))
-    for(p in 1:nrow(pm.df)){
+    res_iter_now <- foreach(p = 1:nrow(pm.df), .combine = rbind) %dopar% {
+      message(paste(p/nrow(pm.df)*100, "% of current PSA done"))
       #time<-Sys.time()
       for(i in 1:nrow(cohort.df)){
+        message(paste(i/nrow(cohort.df)*100, "% of current cohort done"))
         agecat<-ifelse(cohort.df[i,]$age<50,0,NA)
         agecat<-ifelse(cohort.df[i,]$age>=50&cohort.df[i,]$age<60,1,agecat)
         agecat<-ifelse(cohort.df[i,]$age>=60&cohort.df[i,]$age<70,2,agecat)
@@ -69,22 +81,22 @@ model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
         
         ### The probability to die per year
         ar.trans["Alive", "Dead", 1:cycle.length]<- seq(RateToProb(r=(ifelse(cohort.df[i,]$gender==1, 
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
-                                                                                                  100,              
+                                                                             CBS[CBS$Leeftijd==ifelse(cohort.df[i,]$age>99, 
+                                                                                                  99,              
                                                                                                   cohort.df[i,]$age),]$Man_kans,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age>100, 
-                                                                                                  100,
+                                                                             CBS[CBS$Leeftijd==ifelse(cohort.df[i,]$age>99, 
+                                                                                                  99,
                                                                                                   cohort.df[i,]$age),]$Vrouw_kans)), 
                                                                    t=1),
                                                         RateToProb(r=(ifelse(cohort.df[i,]$gender==1,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age +
-                                                                                                    cycle.length>100, 
-                                                                                                  100,
+                                                                             CBS[CBS$Leeftijd==ifelse(cohort.df[i,]$age +
+                                                                                                    cycle.length>99, 
+                                                                                                  99,
                                                                                                   (cohort.df[i,]$age+cycle.length)), 
                                                                                  ]$Man_kans,
-                                                                             CBS[Leeftijd==ifelse(cohort.df[i,]$age+
-                                                                                                    cycle.length>100, 
-                                                                                                  100,
+                                                                             CBS[CBS$Leeftijd==ifelse(cohort.df[i,]$age+
+                                                                                                    cycle.length>99, 
+                                                                                                  99,
                                                                                                   (cohort.df[i,]$age+
                                                                                                      cycle.length)),
                                                                                  ]$Vrouw_kans)), 
@@ -139,9 +151,9 @@ model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
                        pm.df$p.ECMO_c.ind[p]*p.Die_CPR_c.ind)
         p.compl_NE <- 0
         s0<-c((1-p.Die_NE-p.compl_NE),p.Die_NE, p.compl_NE)
-        l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
-        cohort.df[i,]$LYNE<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
-        cohort.df[i,]$QALYNE<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
+        l.markov.int<-dampack::CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+        cohort.df[i,]$LYNE<-dampack::ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+        cohort.df[i,]$QALYNE<-dampack::ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
         cohort.df[i,]$costNE       <- 0
         
         #Decision tree outcome ECMO under threshold
@@ -154,39 +166,31 @@ model <- function(thresholds=c(2,3,4,9), pm.df=NULL, cohort.df=NULL){
         p.compl_EACCI_LO <- (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*((1-pm.df$p.rosc_20min[p])*ifelse(age_CCI<thr, 
                                                                                                    pm.df$p.Compl[p],0)))
         s0<-c((1-p.Die_EACCI_lo-p.compl_EACCI_LO),p.Die_EACCI_lo, p.compl_EACCI_LO )
-        l.markov.int<-CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
-        cohort.df[i,]$LYEACCI_lo<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
-        cohort.df[i,]$QALYEACCI_lo<-ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
+        l.markov.int<-dampack::CalculateMarkovTrace(M = ar.trans, p0 = s0, n.cycles = cycle.length)
+        cohort.df[i,]$LYEACCI_lo<-dampack::ExpectedValue(trans = l.markov.int$trans, rwd =rwd.LY , half = TRUE)
+        cohort.df[i,]$QALYEACCI_lo<-dampack::ExpectedValue(trans = l.markov.int$trans, rwd =rwd.QALY , half = TRUE)
         cohort.df[i,]$costEACCI_lo <- (1-p.DNR)*((1-pm.df$p.ECMO_c.ind[p])*
                                                    ((1-pm.df$p.rosc_20min[p])*ifelse(age_CCI<thr, 
                                                                                      pm.df[p,]$c.ECMO,0)))
         
       }
       
-      LY[p,]$NE       <- mean(cohort.df$LYNE)
-      LY[p,]$EACCI_lo <- mean(cohort.df$LYEACCI_lo)
-      
-      LY[p,]$costNE       <- mean(cohort.df$costNE)
-      LY[p,]$costEACCI_lo <- mean(cohort.df$costEACCI_lo)  
-      
-      LY[p,]$NE_QALY       <- mean(cohort.df$QALYNE)
-      LY[p,]$EACCI_lo_QALY <- mean(cohort.df$QALYEACCI_lo)
+      res_iteration <- c(pm.df[p,],
+                         p_die_NE       = p.Die_NE,
+                         p_die_EACCI_lo = p.Die_EACCI_lo,
+                         NE             = mean(cohort.df$LYNE),
+                         EACCI_lo       = mean(cohort.df$LYEACCI_lo),
+                         costNE         = mean(cohort.df$costNE),
+                         costEACCI_lo   = mean(cohort.df$costEACCI_lo),
+                         NE_QALY        = mean(cohort.df$QALYNE),
+                         EACCI_lo_QALY  = mean(cohort.df$QALYEACCI_lo))
+      return(res_iteration)
       
       #Sys.time()-time    
     }
-    if(thr==2){
-      LY.l[[1]]<-LY
-    }
-    if(thr==3){
-      LY.l[[2]]<-LY
-    }
-    if(thr==4){
-      LY.l[[3]]<-LY
-    }
-    if(thr==9){
-      LY.l[[4]]<-LY
-    }
-
+    
+    LY.l[[paste("thr", thr, sep="")]] <- data.frame(res_iter_now)
+ 
   }
   return(LY.l)
 }

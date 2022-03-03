@@ -46,5 +46,6 @@ make_ce_table <- function(ce){
   result <- cbind(cost, QALY, costqaly, icer)
   result <- result[c(2,3,4,5,1), ]
   rownames(result) <- c("NE", "thr2", "thr3", "thr4", "EALL")
+  return(result)
 }
 
