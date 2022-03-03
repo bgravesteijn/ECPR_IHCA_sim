@@ -43,9 +43,10 @@ make_ce_table <- function(ce){
   
   costqaly <- paste(round(ce[,median(cost/QALY), by=strategy]$V1,1)," (",round(ce[,quantile(cost/QALY, probs=0.025), by=strategy]$V1,1)," - ",round(ce[,quantile(cost/QALY, probs=0.975), by=strategy]$V1,1), ")", sep="")
   
-  result <- cbind(cost, QALY, costqaly, icer)
-  result <- result[c(2,3,4,5,1), ]
-  rownames(result) <- c("NE", "thr2", "thr3", "thr4", "EALL")
+  result <- cbind(cost,QALY, costqaly)
+  result <- result[c(5,1:4), ]
+  result <- cbind(result,icer)
+  rownames(result) <- c("EALL","NE","thr2", "thr3", "thr4")
   return(result)
 }
 

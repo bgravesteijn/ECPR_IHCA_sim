@@ -18,10 +18,10 @@ source("functions/model.R")
 ## Run the model
 set.seed(123)
 res <- model(thresholds = c(2,3,4,9), #Standard, if you change this, the code below needs to change as well
-             pm.df      = prm #[sample(1:nrow(prm),100,replace=FALSE),], #You can sample some parameter sets randomly to save computing time
-             ,
-             cohort.df  = cohort #[sample(1:nrow(cohort),100,replace=FALSE),] #You can sample some patients randomly to save computing time
-             , 
+             pm.df      = prm[sample(1:nrow(prm),100,replace=FALSE),], #You can sample some parameter sets randomly to save computing time
+             
+             cohort.df  = cohort[sample(1:nrow(cohort),100,replace=FALSE),], #You can sample some patients randomly to save computing time
+              
              parallel   = TRUE) #To use multiple cores in your computer for faster computing.
 
 ## Summarize results
